@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pymongo
+qdrant-client
+openai
+python-dotenv
+python-multipart
+
