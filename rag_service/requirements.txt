@@ -5,4 +5,7 @@ qdrant-client
 openai
 python-dotenv
 python-multipart
-
+pdfplumber
+python-docx
+beautifulsoup4
+requests

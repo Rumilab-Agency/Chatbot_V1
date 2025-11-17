@@ -1,112 +1,97 @@
-from fastapi import FastAPI, UploadFile, Form, Query
-from pymongo import MongoClient
-from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, Distance, VectorParams
-from openai import OpenAI
-import uuid
 import os
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, PointStruct
+from openai import OpenAI
+from pymongo import MongoClient
 from dotenv import load_dotenv
+from uuid import uuid4
 
-# Load .env variables
 load_dotenv()
 
+# ---------- ENV VARIABLES ----------
+QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+QDRANT_COLLECTION = "documents"
+
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://mongo:27017")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MONGO_URI = os.getenv("MONGO_URI")
-QDRANT_HOST = os.getenv("QDRANT_HOST")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT") or 6333)
-VECTOR_SIZE = int(os.getenv("VECTOR_SIZE") or 1536)
 
-app = FastAPI()
+# ---------- CLIENTS ----------
+qdrant = QdrantClient(url=QDRANT_URL)
 
-# MongoDB setup
-mongo_client = MongoClient(MONGO_URI)
-kb_db = mongo_client["kb_db"]
-documents_col = kb_db["documents"]
-embeddings_col = kb_db["embeddings"]
+mongo = MongoClient(MONGO_URL)
+db = mongo["rag_db"]
+docs_collection = db["documents"]
 
-# Qdrant setup
-qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-qdrant.recreate_collection(
-    collection_name="kb_vectors",
-    vectors_config=VectorParams(
-        size=VECTOR_SIZE,           # embedding dimension
-        distance=Distance.COSINE
+openai = OpenAI(api_key=OPENAI_API_KEY)
+
+# ---------- CREATE COLLECTION IF NOT EXISTS ----------
+def setup_collection():
+    existing = [c.name for c in qdrant.get_collections().collections]
+    if QDRANT_COLLECTION not in existing:
+        qdrant.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
+        )
+setup_collection()
+
+# ---------- EMBEDDING HELPER ----------
+def embed(text: str):
+    res = openai.embeddings.create(
+        input=text,
+        model="text-embedding-3-small"
     )
-)
+    return res.data[0].embedding
 
-# OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ---------- INGEST PDF ----------
+def ingest_pdf(filepath: str):
+    from PyPDF2 import PdfReader
 
-def generate_embedding(text: str):
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text
-    )
-    return response.data[0].embedding  # new v1 API
+    reader = PdfReader(filepath)
 
-@app.post("/documents")
-async def add_document(title: str = Form(...), file: UploadFile = None, text: str = Form(None)):
-    doc_id = str(uuid.uuid4())
-    content = ""
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text:
+            continue
 
-    if file:
-        content = (await file.read()).decode("utf-8", errors="ignore")
-    elif text:
-        content = text
-    else:
-        return {"error": "No content provided"}
+        vector = embed(text)
+        doc_id = str(uuid4())
 
-    # Save document metadata
-    documents_col.insert_one({
-        "docId": doc_id,
-        "title": title,
-        "type": file.filename.split(".")[-1] if file else "text",
-        "createdAt": None
-    })
+        qdrant.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=[
+                PointStruct(
+                    id=doc_id,
+                    vector=vector,
+                    payload={"text": text}
+                )
+            ]
+        )
 
-    # Split content into chunks
-    chunks = [content[i:i+500] for i in range(0, len(content), 500)]
-
-    points = []
-    for chunk in chunks:
-        embedding = generate_embedding(chunk)
-        chunk_id = str(uuid.uuid4())  # unique UUID for each chunk
-        embeddings_col.insert_one({
-            "docId": doc_id,
-            "chunkId": chunk_id,
-            "text": chunk,
-            "embedding": embedding
+        docs_collection.insert_one({
+            "_id": doc_id,
+            "text": text
         })
-        points.append(PointStruct(
-            id=chunk_id,
-            vector=embedding,
-            payload={"docId": doc_id, "text": chunk}
-        ))
 
-    # Insert into Qdrant
-    qdrant.upsert(collection_name="kb_vectors", points=points)
+# ---------- PROCESS A USER QUERY ----------
+def process_query(query: str):
+    query_emb = embed(query)
 
-    return {"message": "Document ingested", "docId": doc_id}
-
-
-TOP_K = 5  # number of relevant chunks to retrieve
-
-@app.get("/query")
-async def query_kb(message: str = Query(...)):
-    # Generate embedding for user query
-    query_embedding = generate_embedding(message)
-
-    # Search in Qdrant
-    search_result = qdrant.search(
-        collection_name="kb_vectors",
-        query_vector=query_embedding,
-        limit=TOP_K
+    results = qdrant.search(
+        collection_name=QDRANT_COLLECTION,
+        query_vector=query_emb,
+        limit=3
     )
 
-    # Collect retrieved chunks
-    retrieved_chunks = [hit.payload["text"] for hit in search_result]
+    context_chunks = [r.payload["text"] for r in results]
 
-    return {
-        "query": message,
-        "retrieved_chunks": retrieved_chunks
-    }
+    full_context = "\n\n".join(context_chunks)
+
+    chat = openai.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant. Use the provided context for answers."},
+            {"role": "user", "content": f"Context:\n{full_context}\n\nQuestion: {query}"}
+        ]
+    )
+
+    return chat.choices[0].message["content"]

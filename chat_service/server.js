@@ -2,10 +2,18 @@ import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import cors from "cors";   // <-- ADD THIS
 
 dotenv.config();
 
 const app = express();
+
+app.use(cors({
+    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],   // Next.js dev URL
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+}));
+
 app.use(bodyParser.json());
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
